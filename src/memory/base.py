@@ -6,32 +6,36 @@ MemoryBase：所有 memory 方法的统一抽象基类。
 ────────────
 Working Memory（inside-trial，任务执行中的实时上下文）
   当前任务的短期记忆，任务结束后固化为经验记忆。
-  上下文策略（全量 history、摘要、压缩等）由 memory system 自主决定。
+  上下文管理策略（全量 history、摘要、压缩等）完全由 memory 内部决定。
 
-  init_working_memory         任务启动，初始化 working memory
+  init_working_memory         任务启动时调用一次：初始化 working memory，
+                              同时按 memory 自身策略决定是否预加载 experiential memory
+                              （如 SkillMem 在此加载第一、二层：元数据 + SKILL.md）
   add_working_memory          写入一条记录（agent 输出 或 env 反馈，统一接口）
-  retrieve_working_memory     读取 working memory，返回可注入 prompt 的文本（上下文策略由 memory 内部决定：全量 / 摘要 / 压缩）
+  retrieve_working_memory     读取 working memory，返回可直接注入 prompt 的文本，
+                              solver 无需感知其内部构造逻辑
 
 Experiential Memory（cross-trial，跨任务积累的经验）
-  历史经验的持久化存储，供后续任务检索参考。
+  历史经验的持久化存储。
 
-  retrieve_experiential_memory  任务执行中检索历史经验（调用时机 inside-trial，数据来源 cross-trial）
-  add_experiential_memory       任务结束时调用，固化 working memory 并更新经验权重 ← inside-trial / cross-trial 的边界（合并原 save_task_context + backward）
+  retrieve_experiential_memory  agent 主动按需调用的深层检索接口。
+                                基类默认返回空，普通 memory 方法不重写。
+                                专为 SkillMem 第三层（references/scripts）设计：
+                                  - 第一、二层（元数据 + SKILL.md）由 init_working_memory 加载
+                                  - 第三层（详细逻辑/代码）由 agent 在执行中按需触发此方法加载
+                                其他 memory 方法（GenerativeMemory、MemoryBank 等）的
+                                经验检索在 init_working_memory 内部完成，不暴露给 solver。
+
+  add_experiential_memory       任务结束时调用，固化 working memory 并更新经验权重。
+                                合并了原 save_task_context + backward 两个操作。
 
 接口总览（共 5 个）
 ────────────────────
-  init_working_memory          working memory 初始化
+  init_working_memory          working memory 初始化（+ 按需预加载经验）
   add_working_memory           写入 working memory
-  retrieve_working_memory      读取 working memory
-  retrieve_experiential_memory 检索历史经验
+  retrieve_working_memory      读取 working memory → 可用 prompt 字符串
+  retrieve_experiential_memory agent 按需调用的深层检索（SkillMem 第三层专用）
   add_experiential_memory      固化经验 + 更新权重（任务结束时调用）
-
-设计约束
-────────
-- add_working_memory 统一承接原 add_agent_node（agent 输出）和 move_memory_state（env 反馈）两种写入，通过 content 类型区分。
-- retrieve_working_memory 取代原 summarize，上下文策略完全由 memory 内部决定。
-- add_experiential_memory 合并原 save_task_context 和 backward，子类在此方法内自由决定固化轨迹与更新权重的顺序和策略。
-- 子类只需覆盖需要扩展的方法，其余继承基类默认实现。
 """
 
 import os
@@ -44,8 +48,8 @@ from src.llm import LLMCallable
 from src.utils import EmbeddingFunc
 
 # add_working_memory 的 content 类型：
-#   AgentMessage    → agent 的单步输出（原 add_agent_node）
-#   tuple[str, str] → (action, observation)，env 反馈（原 move_memory_state）
+#   AgentMessage    → agent 的单步输出
+#   tuple[str, str] → (action, observation)，env 反馈
 WorkingMemoryContent = Union[AgentMessage, tuple[str, str]]
 
 
@@ -76,21 +80,28 @@ class MemoryBase(StorageNameSpace, ABC):
         task_main: str,
         task_description: str = None,
         context_hint: Optional[dict] = None,
-    ) -> MASMessage:
+    ) -> None:
         """
-        任务启动时调用，初始化 working memory。每个任务开始时调用一次。
+        任务启动时调用一次，完成两件事：
+          1. 初始化 working memory（设置 current_task_context）
+          2. 按 memory 自身策略决定是否预加载 experiential memory
+
+        子类覆盖此方法时，可在 super().__post_init__() 之后追加经验加载逻辑：
+          - EmptyMemory    : 只做初始化，不加载任何经验
+          - GenerativeMemory: 检索 insights / few-shots，拼入初始 prompt
+          - SkillMem       : 加载第一层（元数据摘要）+ 第二层（SKILL.md），
+                             第三层由 agent 按需调用 retrieve_experiential_memory 加载
 
         Args:
-            task_main        : 题目核心内容，用于经验检索的 key。
-            task_description : 完整题目描述（含解题指令），默认同 task_main。
-            context_hint     : 可选任务元信息（如 subject、task_type、difficulty），
-                               子类可用于辅助经验检索或 skill 激活决策，基类忽略。
+            task_main        : 题目核心内容，用于经验检索的 query key。
+            task_description : 完整任务描述（含解题指令），默认同 task_main。
+            context_hint     : 可选任务元信息（如 category、answer_type 等），
+                               子类可用于辅助检索或 skill 激活，基类忽略。
         """
         self.current_task_context = MASMessage(
             task_main=task_main,
             task_description=task_description or task_main,
         )
-        return self.current_task_context
 
     def add_working_memory(
         self,
@@ -101,25 +112,16 @@ class MemoryBase(StorageNameSpace, ABC):
         """
         向 working memory 写入一条记录，统一承接两种写入场景：
 
-        场景一：agent 输出（原 add_agent_node）
+        场景一：agent 输出
             content      = AgentMessage(...)
             upstream_ids = ["node-0", ...]   # 无依赖时传 []
             返回值：当前节点在 StateChain 中的 node_id（str）
 
-        场景二：env 反馈（原 move_memory_state，interactive task 专用）
+        场景二：env 反馈（interactive task 专用）
             content      = (action, observation)
             upstream_ids 忽略
             **kwargs     透传给 StateChain（如 reward=0.5）
             返回值：None
-
-        Args:
-            content      : AgentMessage 或 (action, observation) tuple。
-            upstream_ids : agent 输出场景下的上游节点 ID 列表。
-            **kwargs     : env 反馈场景下的额外参数（如 reward）。
-
-        Returns:
-            str  : agent 输出场景下的 node_id。
-            None : env 反馈场景。
         """
         if isinstance(content, AgentMessage):
             return self.current_task_context.add_message_to_current_state(
@@ -137,16 +139,18 @@ class MemoryBase(StorageNameSpace, ABC):
 
     def retrieve_working_memory(self, **kwargs) -> str:
         """
-        读取当前 working memory，返回可直接注入 prompt 的文本。
+        读取当前 working memory，返回可直接注入 prompt 的字符串。
 
-        上下文策略完全由 memory 内部决定：
-          - 基类默认：全量返回 task_description + task_trajectory
-          - 子类可覆盖：摘要压缩、滑动窗口、关键步骤抽取等
+        基类默认：返回 task_description（不含任何空章节噪声）。
+        子类可覆盖：拼接 trajectory history、摘要压缩、滑动窗口等。
 
-        取代原 summarize() 接口。
+        Returns:
+            str: 可直接作为 user message 内容的 prompt 字符串。
         """
         ctx = self.current_task_context
-        return (ctx.task_description or "") + (ctx.task_trajectory or "")
+        base = ctx.task_description or ""
+        traj = ctx.task_trajectory or ""
+        return base + traj if traj else base
 
     # ─────────────────────────────────────────────────────────────────────────
     # Experiential Memory（cross-trial）
@@ -154,26 +158,28 @@ class MemoryBase(StorageNameSpace, ABC):
 
     def retrieve_experiential_memory(
         self,
-        query_task: str,
-        successful_topk: int = 1,
-        failed_topk: int = 1,
+        query: str,
         **kwargs,
-    ) -> tuple[list[MASMessage], list[MASMessage], list]:
+    ) -> str:
         """
-        任务执行中检索历史经验，为当前任务提供参考。
+        agent 主动按需调用的深层检索接口。
 
-        注意：调用时机是 inside-trial，但数据来源是 cross-trial 积累的结果。
+        设计意图：专为 SkillMem 第三层（references / scripts）设计。
+          - 第一、二层（元数据 + SKILL.md）在 init_working_memory 时已加载进 prompt。
+          - 第三层在 agent 判断需要更多细节时，主动调用此方法获取。
+
+        其他 memory 方法（EmptyMemory、GenerativeMemory 等）的经验检索
+        全部在 init_working_memory 内部完成，不重写此方法（返回空字符串）。
 
         Args:
-            query_task      : 检索查询文本（通常是 task_main）。
-            successful_topk : 返回成功案例数上限。
-            failed_topk     : 返回失败案例数上限。
-            **kwargs        : 子类扩展参数（如 threshold、insight_topk 等）。
+            query  : 检索 query（通常是 agent 当前的意图描述或子任务）。
+            **kwargs: 子类扩展参数（如 topk、threshold 等）。
 
         Returns:
-            tuple: (successful_trajectories, failed_trajectories, insights)
+            str: 检索到的经验文本，可直接追加到 prompt 中。
+                 基类默认返回空字符串。
         """
-        return [], [], []
+        return ""
 
     def add_experiential_memory(
         self,
@@ -184,16 +190,11 @@ class MemoryBase(StorageNameSpace, ABC):
         任务结束时调用，固化 working memory 并更新经验权重。
         这是 inside-trial → cross-trial 的边界。
 
-        合并了原 save_task_context（固化轨迹）和 backward（更新权重）两个操作。
-        子类可自由决定固化与更新的顺序和策略，例如：
-          - 先固化轨迹，再调整 insight 分数
-          - 先提炼 skill，再写入向量库
-
         基类默认实现：仅打标签，不做任何持久化（no-memory baseline）。
 
         Args:
-            label    : olympiad 传 bool；research 传 float rubric score。
-            feedback : 可选的额外反馈文本（如 env 的 feedback_str、judge 分析）。
+            label    : 成功/失败标签（bool）或质量评分（float）。
+            feedback : 可选的额外反馈文本（如 env feedback、judge 分析）。
         """
         if self.current_task_context is None:
             raise RuntimeError("working memory 为空，请先调用 init_working_memory。")

@@ -60,7 +60,6 @@ MAS-Memory-Library:
 │   │   │   ├── __init__.py                      # SingleAgentSolver 模块的初始化
 │   │   │   └── single_agent.py                  # SingleAgentSolver(MetaSolver) 的核心实现
 │   │   ├── __init__.py                          # MAS 相关的抽象和接口设计
-│   │   ├── format.py                            # 任务输入输出的格式规范
 │   │   └── base.py                              # MetaSolver 抽象类
 │   ├─ reasoning/                                # Reasoning
 |   |   ├── __init__.py                          # Reasoning 模块的初始化
